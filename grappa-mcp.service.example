@@ -1,0 +1,14 @@
+[Unit]
+Description=Grappa MCP Server
+After=network.target
+
+[Service]
+User=__USER__
+WorkingDirectory=__INSTALL_DIR__
+EnvironmentFile=__INSTALL_DIR__/.env
+ExecStart=__INSTALL_DIR__/.venv/bin/uvicorn server:app --host __MCP_BIND_HOST__ --port __MCP_BIND_PORT__
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

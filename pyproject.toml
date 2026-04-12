@@ -1,0 +1,16 @@
+[project]
+name = "grappa-mcp"
+version = "0.1.0"
+description = "FastMCP server providing remote shell, file, and Docker log tools over authenticated HTTP."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Vladimir Yakimov" }]
+dependencies = [
+    "fastmcp>=3.1.1",
+    "uvicorn>=0.42.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/vyakimov/grappa-mcp"
+Repository = "https://github.com/vyakimov/grappa-mcp"
