@@ -5,7 +5,7 @@ description = "FastMCP server providing remote shell, file, and Docker log tools
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Vladimir Yakimov" }]
+authors = [{ name = "Victor Yakimov" }]
 dependencies = [
     "fastmcp>=3.1.1",
     "uvicorn>=0.42.0",
