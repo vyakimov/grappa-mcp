@@ -8,14 +8,21 @@ A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes remote tools 
 
 | Tool | Description |
 |------|-------------|
-| `run_command` | Execute a shell command with timeout, env overrides, and output caps |
-| `read_file` | Read a text file, with optional offset/limit |
-| `write_file` | Atomically create or overwrite a file |
+| `run_command` | Execute a shell command with timeout, stdin, env overrides, and output caps |
+| `read_file` | Read a text file by line offset/limit; returns its SHA-256 |
+| `write_file` | Atomically create or overwrite a file (preserves permissions) |
 | `edit_file` | Surgical text replacement with optional SHA-256 optimistic concurrency |
 | `list_directory` | List entries, optional recursive + glob filter |
+| `search_files` | Regex search across file contents, like `grep -rn` |
+| `file_stat` | Metadata (type, size, mode, mtime) plus SHA-256 for files |
+| `delete_file` | Delete a file or directory (recursive delete is opt-in) |
+| `move_file` | Move or rename a file or directory |
 | `docker_logs` | Read container logs (`docker logs --tail`, `--since`) |
+| `docker_ps` | List containers (structured, via `docker ps --format json`) |
 
-Bearer-token auth with constant-time comparison, per-command output cap (200 KB), max timeout (120 s), atomic writes, and a denylist of obviously catastrophic commands (`rm -rf /`, `mkfs.*`, etc.).
+Bearer-token auth with constant-time comparison, per-command output cap (200 KB per stream), max timeout (120 s) with process-group kill and partial output on expiry, atomic permission-preserving writes, an audit log of every tool invocation, an unauthenticated `/healthz` liveness endpoint, and a denylist tripwire for obviously catastrophic commands (`rm -rf /`, `mkfs.*`, etc.).
+
+The optimistic-concurrency workflow: `read_file` returns the file's `sha256`; pass it as `expected_sha256` to `edit_file` and the edit fails cleanly if the file changed in between.
 
 ## Install
 
@@ -89,11 +96,12 @@ All configuration is via environment variables, typically set in `.env`:
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `GRAPPA_MCP_TOKEN` | yes | Bearer token clients must present |
+| `GRAPPA_MCP_TOKEN` | yes | Bearer token clients must present. Comma-separated list allowed, for zero-downtime rotation |
 | `MCP_BIND_HOST` | for systemd | Host interface for the uvicorn bind (used by `install-systemd.sh`) |
 | `MCP_BIND_PORT` | for systemd | Port for the uvicorn bind (used by `install-systemd.sh`) |
 | `GRAPPA_MCP_DEFAULT_CWD` | no | Default `cwd` for `run_command` / `list_directory`. Falls back to `$HOME` |
 | `GRAPPA_MCP_DEFAULT_DOCKER_CONTAINER` | no | Default container for `docker_logs`. If unset, callers must pass `container` |
+| `GRAPPA_MCP_LOG_LEVEL` | no | Audit log level (default `INFO`). Every tool invocation is logged to stderr/journald |
 
 ## Hardening recommendations
 
@@ -103,7 +111,20 @@ All configuration is via environment variables, typically set in `.env`:
   sudo ufw allow from 10.0.0.1 to any port 8020 proto tcp
   ```
 - **Run as a non-root user.** The systemd unit runs as the installing user, not root.
-- **Rotate the token** if any client disclosed it.
+- **Rotate the token** if any client disclosed it. Set `GRAPPA_MCP_TOKEN=new,old` first, migrate clients, then drop the old one.
+- **Watch the audit log.** Every tool call (command, path, container) is logged; `journalctl -u grappa-mcp` is the record of what agents did to the host.
+
+`GET /healthz` responds without authentication, for uptime monitors. Everything else requires the bearer token.
+
+## Development
+
+```bash
+uv sync          # includes dev dependencies
+uv run pytest    # test suite (in-memory MCP transport, no network)
+uv run ruff check .
+```
+
+CI runs lint and tests on Python 3.12 and 3.13 for every push and pull request.
 
 ## License
 
