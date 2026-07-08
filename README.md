@@ -9,6 +9,7 @@ A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes remote tools 
 | Tool | Description |
 |------|-------------|
 | `run_command` | Execute a shell command with timeout, stdin, env overrides, and output caps |
+| `job_start` / `job_status` / `job_kill` / `job_list` | Background jobs for work that outlives the 120 s cap (builds, migrations, servers) |
 | `read_file` | Read a text file by line offset/limit; returns its SHA-256 |
 | `write_file` | Atomically create or overwrite a file (preserves permissions) |
 | `edit_file` | Surgical text replacement with optional SHA-256 optimistic concurrency |
@@ -19,10 +20,13 @@ A [FastMCP](https://github.com/jlowin/fastmcp) server that exposes remote tools 
 | `move_file` | Move or rename a file or directory |
 | `docker_logs` | Read container logs (`docker logs --tail`, `--since`) |
 | `docker_ps` | List containers (structured, via `docker ps --format json`) |
+| `docker_restart` | Restart a container with a configurable graceful-stop timeout |
 
 Bearer-token auth with constant-time comparison, per-command output cap (200 KB per stream), max timeout (120 s) with process-group kill and partial output on expiry, atomic permission-preserving writes, an audit log of every tool invocation, an unauthenticated `/healthz` liveness endpoint, and a denylist tripwire for obviously catastrophic commands (`rm -rf /`, `mkfs.*`, etc.).
 
 The optimistic-concurrency workflow: `read_file` returns the file's `sha256`; pass it as `expected_sha256` to `edit_file` and the edit fails cleanly if the file changed in between.
+
+Background jobs: `job_start` returns a `job_id` for a command that keeps running between calls. Poll it with `job_status` (which returns the output captured so far, and can block up to 60 s waiting for completion), stop it with `job_kill`, and enumerate with `job_list`. Jobs live in server memory only — they do not survive a restart, and finished jobs are retained until evicted by an age cap.
 
 ## Install
 
