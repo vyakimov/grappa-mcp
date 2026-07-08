@@ -9,12 +9,14 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat as statmod
 import tempfile
 from collections.abc import Iterator
 from contextlib import suppress
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -26,6 +28,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 # --- Config ---
 MAX_OUTPUT_BYTES = 200 * 1024  # 200 KB per stream
 MAX_TIMEOUT = 120
+MAX_RUNNING_JOBS = 20  # concurrent background jobs
+MAX_FINISHED_JOBS = 50  # finished jobs kept for job_status before eviction
+MAX_JOB_WAIT = 60  # cap on job_status wait_seconds
 MAX_READ_BYTES = 50 * 1024 * 1024  # refuse read_file on anything larger
 MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024  # search_files skips larger files
 DEFAULT_CWD = os.environ.get("GRAPPA_MCP_DEFAULT_CWD") or os.path.expanduser("~")
@@ -245,39 +250,49 @@ def _audit(tool: str, **fields: object) -> None:
     logger.info("%s %s", tool, " ".join(f"{k}={v!r}" for k, v in fields.items()))
 
 
-# --- Tools ---
-@mcp.tool()
-async def run_command(
-    command: str,
-    cwd: str = DEFAULT_CWD,
-    timeout_seconds: int = 30,
-    env: dict[str, str] | None = None,
-    stdin: str | None = None,
-) -> dict:
-    """Execute a shell command on the host.
-
-    Args:
-        command: The shell command to run.
-        cwd: Working directory. Defaults to GRAPPA_MCP_DEFAULT_CWD or $HOME.
-        timeout_seconds: Max execution time, capped at 120s. On timeout the
-            whole process group is killed and partial output is returned.
-        env: Optional environment variable overrides.
-        stdin: Optional text piped to the command's standard input.
-    """
+def _deny_check(command: str) -> str | None:
     for pattern in DENY_PATTERNS:
         if pattern.search(command):
-            return {"error": f"command matches denylist pattern: {pattern.pattern}"}
+            return f"command matches denylist pattern: {pattern.pattern}"
+    return None
 
-    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT))
-    cwd_path = _normalize_path(cwd)
-    if not cwd_path.is_dir():
-        return {"error": f"cwd does not exist: {cwd_path}"}
 
+@dataclass
+class _ShellProc:
+    """A spawned shell command with bounded output capture.
+
+    The process runs in its own session/process group so kills reach its
+    children, and stdout/stderr are drained concurrently into capped buffers
+    so the child can never block on a full pipe.
+    """
+
+    proc: asyncio.subprocess.Process
+    stdout: _StreamBuffer
+    stderr: _StreamBuffer
+    tasks: set[asyncio.Task] = field(default_factory=set)
+
+    async def finish_io(self) -> None:
+        """Wait for the drain tasks after the process has exited.
+
+        Pipes hit EOF once the group is dead; the cutoff guards against a
+        grandchild that detached into its own session and kept them open.
+        """
+        _, pending = await asyncio.wait(self.tasks, timeout=5)
+        for task in pending:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+
+async def _spawn_shell(
+    command: str,
+    cwd_path: Path,
+    env: dict[str, str] | None,
+    stdin: str | None,
+) -> _ShellProc:
     proc_env = os.environ.copy()
     if env:
         proc_env.update(env)
-
-    _audit("run_command", cwd=str(cwd_path), timeout=timeout_seconds, command=command)
 
     proc = await asyncio.create_subprocess_shell(
         command,
@@ -286,7 +301,7 @@ async def run_command(
         stderr=asyncio.subprocess.PIPE,
         cwd=str(cwd_path),
         env=proc_env,
-        start_new_session=True,  # own process group, so a timeout kills children too
+        start_new_session=True,  # own process group, so kills reach children too
     )
 
     async def feed_stdin() -> None:
@@ -297,40 +312,226 @@ async def run_command(
             await proc.stdin.drain()
         proc.stdin.close()
 
-    stdout_buf = _StreamBuffer(MAX_OUTPUT_BYTES)
-    stderr_buf = _StreamBuffer(MAX_OUTPUT_BYTES)
-    stdin_task = asyncio.create_task(feed_stdin())
-    drain_tasks = {
-        asyncio.create_task(stdout_buf.drain(proc.stdout)),
-        asyncio.create_task(stderr_buf.drain(proc.stderr)),
-    }
+    sp = _ShellProc(proc, _StreamBuffer(MAX_OUTPUT_BYTES), _StreamBuffer(MAX_OUTPUT_BYTES))
+    sp.tasks.add(asyncio.create_task(feed_stdin()))
+    sp.tasks.add(asyncio.create_task(sp.stdout.drain(proc.stdout)))
+    sp.tasks.add(asyncio.create_task(sp.stderr.drain(proc.stderr)))
+    return sp
+
+
+# --- Tools ---
+@mcp.tool()
+async def run_command(
+    command: str,
+    cwd: str = DEFAULT_CWD,
+    timeout_seconds: int = 30,
+    env: dict[str, str] | None = None,
+    stdin: str | None = None,
+) -> dict:
+    """Execute a shell command on the host and wait for it to finish.
+
+    For work that outlives the 120s cap (builds, migrations, servers),
+    use job_start instead.
+
+    Args:
+        command: The shell command to run.
+        cwd: Working directory. Defaults to GRAPPA_MCP_DEFAULT_CWD or $HOME.
+        timeout_seconds: Max execution time, capped at 120s. On timeout the
+            whole process group is killed and partial output is returned.
+        env: Optional environment variable overrides.
+        stdin: Optional text piped to the command's standard input.
+    """
+    if error := _deny_check(command):
+        return {"error": error}
+
+    timeout_seconds = max(1, min(timeout_seconds, MAX_TIMEOUT))
+    cwd_path = _normalize_path(cwd)
+    if not cwd_path.is_dir():
+        return {"error": f"cwd does not exist: {cwd_path}"}
+
+    _audit("run_command", cwd=str(cwd_path), timeout=timeout_seconds, command=command)
+    sp = await _spawn_shell(command, cwd_path, env, stdin)
 
     timed_out = False
     try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout_seconds)
+        await asyncio.wait_for(sp.proc.wait(), timeout=timeout_seconds)
     except TimeoutError:
         timed_out = True
-        _kill_process_group(proc)
-        await proc.wait()
+        _kill_process_group(sp.proc)
+        await sp.proc.wait()
 
-    with suppress(BrokenPipeError, ConnectionResetError):
-        await stdin_task
-    # Pipes hit EOF once the group is dead; the cutoff guards against a
-    # grandchild that detached into its own session and kept them open.
-    _, pending = await asyncio.wait(drain_tasks, timeout=5)
-    for task in pending:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    await sp.finish_io()
 
     return {
-        "exit_code": proc.returncode if not timed_out else -1,
-        "stdout": stdout_buf.text,
-        "stderr": stderr_buf.text,
+        "exit_code": sp.proc.returncode if not timed_out else -1,
+        "stdout": sp.stdout.text,
+        "stderr": sp.stderr.text,
         "timed_out": timed_out,
-        "stdout_truncated": stdout_buf.truncated,
-        "stderr_truncated": stderr_buf.truncated,
+        "stdout_truncated": sp.stdout.truncated,
+        "stderr_truncated": sp.stderr.truncated,
     }
+
+
+# --- Background jobs ---
+# In-memory registry: jobs do not survive a server restart. Finished jobs are
+# kept (with their captured output) until evicted by MAX_FINISHED_JOBS.
+@dataclass
+class _Job:
+    id: str
+    command: str
+    cwd: str
+    sp: _ShellProc
+    started_at: datetime
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    finished_at: datetime | None = None
+    killed: bool = False
+    monitor: asyncio.Task | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.sp.proc.returncode is None
+
+
+_JOBS: dict[str, _Job] = {}
+
+
+def _job_summary(job: _Job) -> dict:
+    end = job.finished_at or datetime.now(UTC)
+    if job.running:
+        state = "running"
+    else:
+        state = "killed" if job.killed else "exited"
+    return {
+        "job_id": job.id,
+        "command": job.command,
+        "cwd": job.cwd,
+        "pid": job.sp.proc.pid,
+        "state": state,
+        "exit_code": job.sp.proc.returncode,
+        "started_at": job.started_at.isoformat(),
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "runtime_seconds": round((end - job.started_at).total_seconds(), 3),
+    }
+
+
+def _evict_finished_jobs() -> None:
+    finished = sorted(
+        (j for j in _JOBS.values() if not j.running and j.finished_at),
+        key=lambda j: j.finished_at,
+    )
+    for job in finished[: max(0, len(finished) - MAX_FINISHED_JOBS)]:
+        del _JOBS[job.id]
+
+
+@mcp.tool()
+async def job_start(
+    command: str,
+    cwd: str = DEFAULT_CWD,
+    env: dict[str, str] | None = None,
+    stdin: str | None = None,
+) -> dict:
+    """Start a shell command as a background job on the host.
+
+    Use this for work that outlives run_command's 120s cap (builds,
+    migrations, servers under test). The job keeps running between calls;
+    poll it with job_status and stop it with job_kill. Jobs live in server
+    memory and do not survive a server restart.
+
+    Args:
+        command: The shell command to run.
+        cwd: Working directory. Defaults to GRAPPA_MCP_DEFAULT_CWD or $HOME.
+        env: Optional environment variable overrides.
+        stdin: Optional text piped to the command's standard input.
+    """
+    if error := _deny_check(command):
+        return {"error": error}
+
+    cwd_path = _normalize_path(cwd)
+    if not cwd_path.is_dir():
+        return {"error": f"cwd does not exist: {cwd_path}"}
+
+    running = sum(1 for j in _JOBS.values() if j.running)
+    if running >= MAX_RUNNING_JOBS:
+        return {"error": f"too many running jobs ({running}); kill or wait for some first"}
+
+    _audit("job_start", cwd=str(cwd_path), command=command)
+    sp = await _spawn_shell(command, cwd_path, env, stdin)
+    job = _Job(
+        id=f"job-{secrets.token_hex(4)}",
+        command=command,
+        cwd=str(cwd_path),
+        sp=sp,
+        started_at=datetime.now(UTC),
+    )
+
+    async def monitor() -> None:
+        await sp.proc.wait()
+        await sp.finish_io()
+        job.finished_at = datetime.now(UTC)
+        job.done.set()
+        _audit("job_finished", job_id=job.id, exit_code=sp.proc.returncode)
+
+    job.monitor = asyncio.create_task(monitor())
+    _JOBS[job.id] = job
+    _evict_finished_jobs()
+
+    return {"job_id": job.id, "pid": sp.proc.pid, "state": "running"}
+
+
+@mcp.tool()
+async def job_status(job_id: str, wait_seconds: int = 0) -> dict:
+    """Get a background job's state and the output captured so far.
+
+    Args:
+        job_id: The id returned by job_start.
+        wait_seconds: If > 0, block up to this many seconds (capped at 60)
+            for the job to finish before reporting. Lets a poll loop sleep
+            server-side instead of hammering the tool.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        return {"error": f"unknown job: {job_id} (jobs are lost on server restart)"}
+
+    wait_seconds = max(0, min(wait_seconds, MAX_JOB_WAIT))
+    if wait_seconds and not job.done.is_set():
+        with suppress(TimeoutError):
+            await asyncio.wait_for(job.done.wait(), timeout=wait_seconds)
+
+    return _job_summary(job) | {
+        "stdout": job.sp.stdout.text,
+        "stderr": job.sp.stderr.text,
+        "stdout_truncated": job.sp.stdout.truncated,
+        "stderr_truncated": job.sp.stderr.truncated,
+    }
+
+
+@mcp.tool()
+async def job_kill(job_id: str) -> dict:
+    """Kill a running background job (SIGKILL to its whole process group).
+
+    Args:
+        job_id: The id returned by job_start.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        return {"error": f"unknown job: {job_id} (jobs are lost on server restart)"}
+    if not job.running:
+        return {"error": "job already finished"} | _job_summary(job)
+
+    _audit("job_kill", job_id=job.id, command=job.command)
+    job.killed = True
+    _kill_process_group(job.sp.proc)
+    with suppress(TimeoutError):
+        await asyncio.wait_for(job.done.wait(), timeout=5)
+
+    return _job_summary(job)
+
+
+@mcp.tool()
+async def job_list() -> dict:
+    """List background jobs (running, and finished ones not yet evicted)."""
+    jobs = sorted(_JOBS.values(), key=lambda j: j.started_at)
+    return {"jobs": [_job_summary(j) for j in jobs]}
 
 
 @mcp.tool()
@@ -761,6 +962,40 @@ async def docker_ps(all: bool = False) -> dict:
             with suppress(json.JSONDecodeError):
                 containers.append(json.loads(line))
     return {"containers": containers}
+
+
+@mcp.tool()
+async def docker_restart(
+    container: str | None = None,
+    stop_timeout: int = 10,
+) -> dict:
+    """Restart a Docker container on the host.
+
+    Args:
+        container: Container name. Falls back to GRAPPA_MCP_DEFAULT_DOCKER_CONTAINER.
+        stop_timeout: Seconds to wait for a graceful stop before the daemon
+            kills the container (docker restart --time).
+    """
+    container = container or DEFAULT_DOCKER_CONTAINER
+    if not container:
+        return {"error": "container is required (or set GRAPPA_MCP_DEFAULT_DOCKER_CONTAINER)"}
+    if not _CONTAINER_NAME_RE.fullmatch(container):
+        return {"error": f"invalid container name: {container}"}
+
+    stop_timeout = max(0, min(stop_timeout, 300))
+    _audit("docker_restart", container=container, stop_timeout=stop_timeout)
+    res = await _run_exec(
+        ["docker", "restart", "--time", str(stop_timeout), container],
+        timeout=stop_timeout + 60,
+    )
+    if isinstance(res, dict):
+        return res
+    _stdout, stderr, exit_code = res
+    if exit_code != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        return {"error": detail or f"docker restart exited {exit_code}"}
+
+    return {"container": container, "restarted": True}
 
 
 # --- App setup ---
